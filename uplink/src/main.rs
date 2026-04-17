@@ -12,9 +12,14 @@ use std::process::ExitCode;
 use std::str::FromStr;
 use std::time::{Duration};
 use chrono::{DateTime, Utc};
+use crate::protocol::{
+    create_fingerprint, read_diffmap, write_dirfp, DiffMap, DirFp,
+    OP_UPLOAD, OP_DOWNLOAD, OP_REMOVE,
+};
 
-#[path = "../../fingerprint.rs"]
-mod fingerprint;
+#[path = "../../protocol.rs"]
+#[allow(unused)]
+mod protocol;
 
 const DEFAULT_CFG: &str = ".UPLINK.toml";
 const SPINNER_LOAD: &str = "←↖↑↗→↘↓↙";
@@ -28,6 +33,7 @@ struct Config {
     dir: PathBuf,
     dest: PathBuf,
     server: SocketAddrV4,
+    no_delete: bool
 }
 
 impl Config {
@@ -72,9 +78,6 @@ fn default_cfg_path() -> PathBuf {
     PathBuf::from_str(DEFAULT_CFG).unwrap()
 }
 
-const OP_UPLOAD: u8 = 0;
-const OP_DOWNLOAD: u8 = 1;
-const OP_REMOVE: u8 = 2;
 const ZSTD_LEVEL: i32 = 3;
 
 fn step(msg: impl AsRef<str>) {
@@ -97,10 +100,22 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     Upload { name: String, dir: PathBuf },
-    Download { name: String, dest: PathBuf },
+    Download {
+        name: String,
+        dest: PathBuf,
+        #[arg(long, alias = "preserve", default_value = "true")]
+        no_delete: bool
+    },
     Push { cfg: Option<PathBuf> },
     Pull { cfg: Option<PathBuf> },
-    Init { name: String, dir: PathBuf, dest: Option<PathBuf>, cfg_path: Option<PathBuf> },
+    Init {
+        name: String,
+        dir: PathBuf,
+        dest: Option<PathBuf>,
+        cfg_path: Option<PathBuf>,
+        #[arg(long, alias = "preserve", default_value = "true")]
+        no_delete: bool,
+    },
     Remove {
         #[arg(long, group = "target")]
         name: Option<String>,
@@ -129,7 +144,7 @@ enum Error {
 }
 
 impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Error::Io(e) => write!(f, "io error: {}", e),
             Error::Connect { addr, source } => write!(f, "failed to connect to {} ({})", addr, source),
@@ -221,20 +236,6 @@ fn write_name(stream: &mut TcpStream, name: &str) -> Result<()> {
     Ok(())
 }
 
-fn dir_size(dir: &Path) -> Result<u64> {
-    let mut total = 0u64;
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let ft = entry.file_type()?;
-        if ft.is_dir() {
-            total += dir_size(&entry.path())?;
-        } else if ft.is_file() {
-            total += entry.metadata()?.len();
-        }
-    }
-    Ok(total)
-}
-
 fn progress(len: u64, msg: &'static str, spinner: &'static str) -> Result<ProgressBar> {
     let pb = ProgressBar::new(len);
     pb.set_style(
@@ -252,18 +253,43 @@ fn progress(len: u64, msg: &'static str, spinner: &'static str) -> Result<Progre
     Ok(pb)
 }
 
-fn pack_dir(dir: &Path) -> Result<Vec<u8>> {
+fn spinner(msg: &'static str, spinner: &'static str) -> Result<ProgressBar> {
+    let pb = ProgressBar::new(1);
+    pb.set_style(
+        ProgressStyle::default_spinner()
+            .template(
+                "  {spinner:.cyan} {msg:<12.bold.cyan}",
+            )?
+            .tick_chars(spinner)
+    );
+    pb.set_message(msg);
+    pb.enable_steady_tick(Duration::from_millis(80));
+    Ok(pb)
+}
+
+fn pack_dir_dm(dm: DiffMap, dir: &Path) -> Result<Vec<u8>> {
     if !dir.is_dir() {
         return Err(Error::NotADirectory(dir.to_path_buf()));
     }
-    let total = dir_size(dir).unwrap_or(0);
+
+    let upload_paths: Vec<&String> = dm.get(&0).map(|v| v.iter().collect()).unwrap_or_default();
+
+    let total = upload_paths
+        .iter()
+        .filter_map(|p| fs::metadata(dir.join(p)).ok())
+        .map(|m| m.len())
+        .sum();
+
     let pb = progress(total, "packing", SPINNER_PACK)?;
 
     let mut tar_buf = Vec::new();
     {
         let writer = pb.wrap_write(&mut tar_buf);
         let mut builder = tar::Builder::new(writer);
-        builder.append_dir_all(".", dir)?;
+        for path in &upload_paths {
+            let full_path = dir.join(path);
+            builder.append_path_with_name(&full_path, path)?;
+        }
         builder.finish()?;
     }
 
@@ -278,6 +304,7 @@ fn pack_dir(dir: &Path) -> Result<Vec<u8>> {
         encoder.finish()?;
     }
     pb.finish_and_clear();
+
     let ratio = (compressed.len() as f64 / tar_buf.len() as f64) * 100f64 - 100f64;
     info(
         "compressed",
@@ -290,56 +317,94 @@ fn pack_dir(dir: &Path) -> Result<Vec<u8>> {
     Ok(compressed)
 }
 
-fn unpack_to(dest: &Path, data: &[u8]) -> Result<()> {
+fn apply_diff(dest: &Path, dm: &DiffMap, data: &[u8], no_delete: bool) -> Result<()> {
     fs::create_dir_all(dest)?;
 
-    let mut decompressed = Vec::new();
-    {
-        let pb = progress(data.len() as u64, "decomp", SPINNER_DECOMP)?;
-        let mut decoder = zstd::Decoder::new(pb.wrap_read(data))?;
-        io::copy(&mut decoder, &mut decompressed)?;
+    // Create dirs
+    if let Some(dirs) = dm.get(&2) {
+        for dir in dirs {
+            fs::create_dir_all(dest.join(dir))?;
+        }
+    }
+
+    // Decompress and unpack uploads
+    if dm.get(&0).is_some_and(|v| !v.is_empty()) && !data.is_empty() {
+        let mut decompressed = Vec::new();
+        {
+            let pb = progress(data.len() as u64, "decomp", SPINNER_DECOMP)?;
+            let mut decoder = zstd::Decoder::new(pb.wrap_read(data))?;
+            io::copy(&mut decoder, &mut decompressed)?;
+            pb.finish_and_clear();
+        }
+
+        let pb = progress(decompressed.len() as u64, "unpack", SPINNER_PACK)?;
+        {
+            let reader = pb.wrap_read(Cursor::new(&decompressed));
+            let mut archive = tar::Archive::new(reader);
+            archive.unpack(dest)?;
+        }
         pb.finish_and_clear();
     }
 
-    let pb = progress(decompressed.len() as u64, "unpack", SPINNER_PACK)?;
-    {
-        let reader = pb.wrap_read(Cursor::new(&decompressed));
-        let mut archive = tar::Archive::new(reader);
-        archive.unpack(dest)?;
+    // Delete files/dirs
+    if !no_delete && let Some(deletions) = dm.get(&1) {
+        for path in deletions {
+            let full_path = dest.join(path);
+            if full_path.is_dir() {
+                fs::remove_dir_all(&full_path)?;
+            } else if full_path.exists() {
+                fs::remove_file(&full_path)?;
+            }
+        }
     }
-    pb.finish_and_clear();
+
     Ok(())
 }
 
 fn upload(server: SocketAddrV4, name: &str, dir: &Path) -> Result<()> {
-    step(format!("Packing {}", style(dir.display()).cyan()));
-    let data = pack_dir(dir)?;
-
-    step(format!("Uploading to {}", style(server).cyan()));
     let mut stream = TcpStream::connect(SocketAddr::V4(server)).map_err(|source| Error::Connect {
         addr: server.to_string(),
         source,
     })?;
     stream.write_all(&[OP_UPLOAD])?;
     write_name(&mut stream, name)?;
-    stream.write_all(&(data.len() as u64).to_le_bytes())?;
+    let fp = create_fingerprint(dir)?;
+    write_dirfp(&mut stream, &fp)?;
+    let dm = read_diffmap(&mut stream)?;
 
-    let pb = progress(data.len() as u64, "upload", SPINNER_LOAD)?;
-    let mut written = 0usize;
-    let chunk = 64 * 1024;
-    while written < data.len() {
-        let end = (written + chunk).min(data.len());
-        stream.write_all(&data[written..end])?;
-        written = end;
-        pb.set_position(written as u64);
+    if dm.is_empty() {
+        step("Already up to date");
+        let mut ack = [0u8; 1];
+        stream.read_exact(&mut ack)?;
+        return Ok(());
     }
-    pb.finish_and_clear();
 
+    if dm.get(&0).is_some_and(|v| !v.is_empty()) {
+        step(format!("Packing {}", style(dir.display()).cyan()));
+        let data = pack_dir_dm(dm, dir)?;
+        stream.write_all(&(data.len() as u64).to_le_bytes())?;
+
+        step(format!("Uploading to {}", style(server).cyan()));
+        let pb = progress(data.len() as u64, "upload", SPINNER_LOAD)?;
+        let mut written = 0usize;
+        let chunk = 64 * 1024;
+        while written < data.len() {
+            let end = (written + chunk).min(data.len());
+            stream.write_all(&data[written..end])?;
+            written = end;
+            pb.set_position(written as u64);
+        }
+        pb.finish_and_clear();
+    }
+
+    let spinner = spinner("Server is processing", SPINNER_LOAD)?;
     let mut ack = [0u8; 1];
     stream.read_exact(&mut ack)?;
     if ack[0] != 1 {
+        spinner.finish_and_clear();
         return Err(Error::ServerRejected {opcode: OP_UPLOAD});
     }
+    spinner.finish_and_clear();
     info(
         "uploaded",
         format!("{}", style(name).bold().yellow())
@@ -366,7 +431,7 @@ fn read_meta(stream: &mut TcpStream) -> Result<Metadata> {
     Ok(meta)
 }
 
-fn download(server: SocketAddrV4, name: &str, dest: &Path) -> Result<()> {
+fn download(server: SocketAddrV4, name: &str, dest: &Path, no_delete: bool) -> Result<()> {
     step(format!(
         "Requesting '{}' from {}",
         style(name).cyan(),
@@ -379,33 +444,62 @@ fn download(server: SocketAddrV4, name: &str, dest: &Path) -> Result<()> {
     stream.write_all(&[OP_DOWNLOAD])?;
     write_name(&mut stream, name)?;
 
+    let local_fp = if dest.is_dir() {
+        create_fingerprint(dest)?
+    } else {
+        DirFp::new()
+    };
+    write_dirfp(&mut stream, &local_fp)?;
+
+    let spinner = spinner("Server is processing", SPINNER_LOAD)?;
+    let mut status = [0u8; 1];
+    stream.read_exact(&mut status)?;
+    if status[0] == 0 {
+        spinner.finish_and_clear();
+        return Err(Error::NotFound(name.to_string()));
+    }
+
+    let dm = read_diffmap(&mut stream)?;
+
     let mut len_buf = [0u8; 8];
     stream.read_exact(&mut len_buf)?;
     let len = u64::from_le_bytes(len_buf);
     let meta = read_meta(&mut stream)?;
-    if len == 0 {
-        return Err(Error::NotFound(name.to_string()));
-    }
-    info("uploaded", style(meta).green().bold().to_string());
-    info("size", style(format_size(len)).green().bold().to_string());
 
-    let pb = progress(len, "download", SPINNER_LOAD)?;
-    let mut data = Vec::with_capacity(len as usize);
-    {
-        let mut reader = pb.wrap_read(stream.take(len));
-        reader.read_to_end(&mut data)?;
-    }
-    pb.finish_and_clear();
+    spinner.finish_and_clear();
 
-    if (data.len() as u64) != len {
-        return Err(Error::ShortRead {
-            expected: len,
-            got: data.len() as u64,
-        });
+    info("updated", style(meta).green().bold().to_string());
+
+    if dm.is_empty() {
+        step("Already up to date");
+        return Ok(());
     }
 
-    step(format!("Unpacking into {}", style(dest.display()).cyan()));
-    unpack_to(dest, &data)?;
+    if len > 0 {
+        info("patch size", style(format_size(len)).green().bold().to_string());
+
+        let pb = progress(len, "download", SPINNER_LOAD)?;
+        let mut data = Vec::with_capacity(len as usize);
+        {
+            let mut reader = pb.wrap_read(stream.take(len));
+            reader.read_to_end(&mut data)?;
+        }
+        pb.finish_and_clear();
+
+        if (data.len() as u64) != len {
+            return Err(Error::ShortRead {
+                expected: len,
+                got: data.len() as u64,
+            });
+        }
+
+        step(format!("Unpacking into {}", style(dest.display()).cyan()));
+        apply_diff(dest, &dm, &data, no_delete)?;
+    } else {
+        step(format!("Applying changes to {}", style(dest.display()).cyan()));
+        apply_diff(dest, &dm, &[], no_delete)?;
+    }
+
     info(
         "downloaded",
         format!("{}", style(name).bold().yellow())
@@ -419,14 +513,16 @@ fn init(
     dir: PathBuf,
     dest: PathBuf,
     cfg_path: PathBuf,
+    no_delete: bool
 ) -> Result<()> {
     step(format!("Initializing {}", style(cfg_path.display()).cyan()));
-    let cfg = Config { name, dir, dest, server };
+    let cfg = Config { name, dir, dest, server, no_delete };
     cfg.save(&cfg_path)?;
     info("name", style(&cfg.name).bold().yellow().to_string());
     info("dir", style(cfg.dir.display()).cyan().to_string());
     info("dest", style(cfg.dest.display()).cyan().to_string());
     info("server", style(cfg.server).cyan().to_string());
+    info("no-delete (preserve)", style(cfg.no_delete).cyan().to_string());
     Ok(())
 }
 
@@ -437,7 +533,7 @@ fn push(cfg_path: PathBuf) -> Result<()> {
 
 fn pull(cfg_path: PathBuf) -> Result<()> {
     let cfg = Config::load(&cfg_path)?;
-    download(cfg.server, &cfg.name, &cfg.dest)
+    download(cfg.server, &cfg.name, &cfg.dest, cfg.no_delete)
 }
 
 fn remove(name: Option<String>, server: SocketAddrV4, config_path: Option<PathBuf>, preserve_cfg: bool) -> Result<()> {
@@ -488,15 +584,16 @@ fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Upload { name, dir } => upload(cli.server, &name, &dir),
-        Cmd::Download { name, dest } => download(cli.server, &name, &dest),
+        Cmd::Download { name, dest, no_delete } => download(cli.server, &name, &dest, no_delete),
         Cmd::Push { cfg } => push(cfg.unwrap_or_else(default_cfg_path)),
         Cmd::Pull { cfg } => pull(cfg.unwrap_or_else(default_cfg_path)),
-        Cmd::Init { name, dir, dest, cfg_path } => init(
+        Cmd::Init { name, dir, dest, cfg_path, no_delete } => init(
             cli.server,
             name,
             dir.clone(),
             dest.unwrap_or(dir),
             cfg_path.unwrap_or_else(default_cfg_path),
+            no_delete
         ),
         Cmd::Remove { name, cfg, preserve_cfg } =>
             remove(name, cli.server, cfg, preserve_cfg),

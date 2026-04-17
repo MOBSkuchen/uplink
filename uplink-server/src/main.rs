@@ -1,7 +1,7 @@
 use clap::Parser;
 use std::fmt;
-use std::fs::{self, DirEntry, File};
-use std::io::{self, Read, Write};
+use std::fs::{self, File};
+use std::io::{self, Cursor, Read, Write};
 use std::net::{SocketAddrV4, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -9,14 +9,14 @@ use std::string::FromUtf8Error;
 use std::thread;
 use std::time::UNIX_EPOCH;
 
-#[path = "../../fingerprint.rs"]
-mod fingerprint;
+#[path = "../../protocol.rs"]
+#[allow(unused)]
+mod protocol;
 
-const OP_UPLOAD: u8 = 0;
-const OP_DOWNLOAD: u8 = 1;
-const OP_REMOVE: u8 = 2;
-const MAX_NAME_LEN: u32 = 512;
-const MAX_PAYLOAD: u64 = 16 * 1024 * 1024 * 1024;
+use crate::protocol::{
+    OP_UPLOAD, OP_DOWNLOAD, OP_REMOVE, MAX_NAME_LEN, MAX_PAYLOAD,
+    DirFp, diff, read_dirfp, write_dirfp, write_diffmap,
+};
 
 #[derive(Parser)]
 #[command(name = "uplink-server", about = "Uplink directory sync server")]
@@ -104,101 +104,190 @@ fn read_name(stream: &mut TcpStream) -> Result<String> {
     Ok(s)
 }
 
-fn store_path(storage: &Path, name: &str) -> PathBuf {
-    storage.join(format!("{}.tar.zst", name))
+// Storage layout:
+//   storage/{name}/       — unpacked directory tree
+//   storage/{name}.fp     — serialized DirFp
+//   storage/{name}.meta   — timestamp (8 bytes LE)
+
+fn store_dir(storage: &Path, name: &str) -> PathBuf {
+    storage.join(name)
+}
+
+fn store_fp_path(storage: &Path, name: &str) -> PathBuf {
+    storage.join(format!("{}.fp", name))
+}
+
+fn load_stored_fp(storage: &Path, name: &str) -> Result<DirFp> {
+    let path = store_fp_path(storage, name);
+    if !path.exists() {
+        return Ok(DirFp::new());
+    }
+    let data = fs::read(&path).map_err(|e| Error::LoadStorage { path: path.clone(), source: e })?;
+    let mut cursor = Cursor::new(data);
+    read_dirfp(&mut cursor).map_err(Error::Io)
+}
+
+fn save_stored_fp(storage: &Path, name: &str, fp: &DirFp) -> Result<()> {
+    let path = store_fp_path(storage, name);
+    let mut file = File::create(&path).map_err(|e| Error::CreateStorage { path: path.clone(), source: e })?;
+    write_dirfp(&mut file, fp)?;
+    file.flush()?;
+    Ok(())
 }
 
 fn store_meta(storage: &Path, name: &str) -> Result<()> {
     let path = storage.join(format!("{}.meta", name));
-    let mut file = File::options().write(true).create(true).truncate(true).open(path.clone()).map_err(|e| {Error::CreateStorage {path: path.clone(), source: e}})?;
-    file.write_all(&UNIX_EPOCH.elapsed().unwrap().as_secs().to_le_bytes()).map_err(|e| {Error::CreateStorage {path, source: e}})?;
+    let mut file = File::options().write(true).create(true).truncate(true).open(path.clone())
+        .map_err(|e| Error::CreateStorage { path: path.clone(), source: e })?;
+    file.write_all(&UNIX_EPOCH.elapsed().unwrap().as_secs().to_le_bytes())
+        .map_err(|e| Error::CreateStorage { path, source: e })?;
     file.flush()?;
     Ok(())
 }
 
 fn give_meta(storage: &Path, name: &str) -> Result<[u8; 8]> {
     let path = storage.join(format!("{}.meta", name));
-    let mut file = File::options().read(true).open(path.clone()).map_err(|e| {Error::LoadStorage {path: path.clone(), source: e}})?;
+    let mut file = File::options().read(true).open(path.clone())
+        .map_err(|e| Error::LoadStorage { path: path.clone(), source: e })?;
     let mut buf = [0u8; 8];
-    file.read_exact(&mut  buf).map_err(|e| {Error::LoadStorage {path: path.clone(), source: e}})?;
+    file.read_exact(&mut buf).map_err(|e| Error::LoadStorage { path, source: e })?;
     Ok(buf)
 }
 
 fn handle_upload(stream: &mut TcpStream, storage: &Path) -> Result<()> {
     let name = read_name(stream)?;
-    let mut len_buf = [0u8; 8];
-    stream.read_exact(&mut len_buf)?;
-    let len = u64::from_le_bytes(len_buf);
-    if len > MAX_PAYLOAD {
-        return Err(Error::PayloadTooLarge(len));
+    let client_fp = read_dirfp(stream)?;
+    let server_fp = load_stored_fp(storage, &name)?;
+    let dm = diff(&client_fp, &server_fp);
+
+    write_diffmap(stream, &dm)?;
+
+    let dir = store_dir(storage, &name);
+    fs::create_dir_all(&dir)?;
+
+    // Create dirs (opcode 2)
+    if let Some(dirs) = dm.get(&2) {
+        for d in dirs {
+            fs::create_dir_all(dir.join(d))?;
+        }
     }
 
-    fs::create_dir_all(storage)?;
-    let tmp = storage.join(format!("{}.tar.zst.tmp", name));
-    let final_path = store_path(storage, &name);
+    // Receive and unpack uploads (opcode 0)
+    if dm.get(&0).is_some_and(|v| !v.is_empty()) {
+        let mut len_buf = [0u8; 8];
+        stream.read_exact(&mut len_buf)?;
+        let len = u64::from_le_bytes(len_buf);
+        if len > MAX_PAYLOAD {
+            return Err(Error::PayloadTooLarge(len));
+        }
 
-    {
-        let mut file = File::create(&tmp)?;
-        let mut remaining = len;
-        let mut buf = vec![0u8; 64 * 1024];
-        while remaining > 0 {
-            let want = (buf.len() as u64).min(remaining) as usize;
-            let n = stream.read(&mut buf[..want])?;
+        let mut compressed = vec![0u8; len as usize];
+        let mut received = 0usize;
+        while received < len as usize {
+            let n = stream.read(&mut compressed[received..])?;
             if n == 0 {
                 return Err(Error::ClientDisconnected);
             }
-            file.write_all(&buf[..n])?;
-            remaining -= n as u64;
+            received += n;
         }
-        file.flush()?;
+
+        let mut decompressed = Vec::new();
+        let mut decoder = zstd::Decoder::new(Cursor::new(&compressed))?;
+        io::copy(&mut decoder, &mut decompressed)?;
+
+        let mut archive = tar::Archive::new(Cursor::new(&decompressed));
+        archive.unpack(&dir)?;
+
+        println!("  received {} bytes compressed", len);
     }
 
-    fs::rename(&tmp, &final_path)?;
+    // Apply deletes (opcode 1)
+    if let Some(deletions) = dm.get(&1) {
+        for path in deletions {
+            let full = dir.join(path);
+            if full.is_dir() {
+                let _ = fs::remove_dir_all(&full);
+            } else if full.exists() {
+                let _ = fs::remove_file(&full);
+            }
+        }
+    }
+
+    // After applying all diffs, storage matches client
+    save_stored_fp(storage, &name, &client_fp)?;
+    store_meta(storage, &name)?;
     stream.write_all(&[1u8])?;
-    store_meta(storage, name.as_str())?;
-    println!("stored '{}' ({} bytes)", name, len);
+    println!("stored '{}'", name);
     Ok(())
 }
 
 fn handle_download(stream: &mut TcpStream, storage: &Path) -> Result<()> {
     let name = read_name(stream)?;
-    let path = store_path(storage, &name);
-    if !path.exists() {
-        stream.write_all(&0u64.to_le_bytes())?;
+    let client_fp = read_dirfp(stream)?;
+
+    let dir = store_dir(storage, &name);
+    if !dir.exists() || !dir.is_dir() {
+        stream.write_all(&[0u8])?;
         println!("missing '{}'", name);
         return Ok(());
     }
-    let fs_meta = fs::metadata(&path)?;
-    let len = fs_meta.len();
-    stream.write_all(&len.to_le_bytes())?;
-    let meta = give_meta(storage, &name)?;
-    stream.write_all(&meta)?;
+    stream.write_all(&[1u8])?;
 
-    let mut file = File::open(&path)?;
-    let mut buf = vec![0u8; 64 * 1024];
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break;
+    let server_fp = load_stored_fp(storage, &name)?;
+    let dm = diff(&server_fp, &client_fp);
+
+    write_diffmap(stream, &dm)?;
+
+    let meta = give_meta(storage, &name)?;
+
+    if let Some(uploads) = dm.get(&0) {
+        if !uploads.is_empty() {
+            let mut tar_buf = Vec::new();
+            {
+                let mut builder = tar::Builder::new(&mut tar_buf);
+                for path in uploads {
+                    let full = dir.join(path);
+                    builder.append_path_with_name(&full, path)?;
+                }
+                builder.finish()?;
+            }
+
+            let mut compressed = Vec::new();
+            let mut encoder = zstd::Encoder::new(&mut compressed, 3)?;
+            io::copy(&mut Cursor::new(&tar_buf), &mut encoder)?;
+            encoder.finish()?;
+
+            let len = compressed.len() as u64;
+            stream.write_all(&len.to_le_bytes())?;
+            stream.write_all(&meta)?;
+            stream.write_all(&compressed)?;
+            println!("served '{}' ({} bytes compressed)", name, len);
+            return Ok(());
         }
-        stream.write_all(&buf[..n])?;
     }
-    println!("served '{}' ({} bytes)", name, len);
+
+    // No file data to send
+    stream.write_all(&0u64.to_le_bytes())?;
+    stream.write_all(&meta)?;
+    println!("served '{}' (no file changes)", name);
     Ok(())
 }
 
 fn handle_remove(stream: &mut TcpStream, storage: &Path) -> Result<()> {
     let name = read_name(stream)?;
-    let path = store_path(storage, &name);
-    if !path.exists() {
-        stream.write_all(&0u64.to_le_bytes())?;
+    let dir = store_dir(storage, &name);
+    if !dir.exists() {
+        stream.write_all(&[0u8])?;
         println!("missing '{}'", name);
         return Ok(());
     }
     let meta_path = storage.join(format!("{}.meta", name));
-    fs::remove_file(path)?;
-    fs::remove_file(meta_path)?;
+    let fp_path = store_fp_path(storage, &name);
+    fs::remove_dir_all(&dir)?;
+    let _ = fs::remove_file(&meta_path);
+    let _ = fs::remove_file(&fp_path);
     stream.write_all(&[1u8])?;
+    println!("removed '{}'", name);
     Ok(())
 }
 
@@ -257,8 +346,6 @@ fn run() -> Result<()> {
 }
 
 fn main() -> ExitCode {
-    let paths = fs::read_dir("./").unwrap().collect::<Vec<io::Result<DirEntry>>>();
-    println!("{:?}", paths);
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
