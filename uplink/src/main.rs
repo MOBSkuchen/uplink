@@ -3,14 +3,20 @@ use console::style;
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::fmt::{Formatter};
 use std::fs;
 use std::io::{self, Cursor, Read, Write};
 use std::net::{SocketAddr, SocketAddrV4, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::str::FromStr;
+use std::time::{Duration};
+use chrono::{DateTime, Utc};
 
-const DEFAULT_CFG: &str = ".UPLINK.json";
+#[path = "../../fingerprint.rs"]
+mod fingerprint;
+
+const DEFAULT_CFG: &str = ".UPLINK.toml";
 const SPINNER_LOAD: &str = "←↖↑↗→↘↓↙";
 const SPINNER_COMP: &str = "┤┘┴└├┌┬┐";
 const SPINNER_DECOMP: &str = "▖▘▝▗";
@@ -26,6 +32,7 @@ struct Config {
 
 impl Config {
     fn load(path: &Path) -> Result<Self> {
+        step(format!("Loading {}", style(path.display()).cyan()));
         let text = fs::read_to_string(path).map_err(|source| Error::ConfigRead {
             path: path.to_path_buf(),
             source,
@@ -67,6 +74,7 @@ fn default_cfg_path() -> PathBuf {
 
 const OP_UPLOAD: u8 = 0;
 const OP_DOWNLOAD: u8 = 1;
+const OP_REMOVE: u8 = 2;
 const ZSTD_LEVEL: i32 = 3;
 
 fn step(msg: impl AsRef<str>) {
@@ -92,7 +100,15 @@ enum Cmd {
     Download { name: String, dest: PathBuf },
     Push { cfg: Option<PathBuf> },
     Pull { cfg: Option<PathBuf> },
-    Init {name: String, dir: PathBuf, dest: Option<PathBuf>, cfg_path: Option<PathBuf>},
+    Init { name: String, dir: PathBuf, dest: Option<PathBuf>, cfg_path: Option<PathBuf> },
+    Remove {
+        #[arg(long, group = "target")]
+        name: Option<String>,
+        #[arg(long, group = "target", conflicts_with = "name")]
+        cfg: Option<PathBuf>,
+        #[arg(long, alias = "preserve-config", default_value = "false", required = false)]
+        preserve_cfg: bool
+    },
 }
 
 #[derive(Debug)]
@@ -102,7 +118,7 @@ enum Error {
     NotADirectory(PathBuf),
     InvalidName,
     NameTooLong,
-    ServerRejected,
+    ServerRejected{ opcode: u8 },
     NotFound(String),
     ShortRead { expected: u64, got: u64 },
     ProgressTemplate(indicatif::style::TemplateError),
@@ -120,14 +136,21 @@ impl fmt::Display for Error {
             Error::NotADirectory(p) => write!(f, "not a directory: {}", p.display()),
             Error::InvalidName => write!(f, "invalid name"),
             Error::NameTooLong => write!(f, "name too long"),
-            Error::ServerRejected => write!(f, "server rejected upload"),
+            Error::ServerRejected {opcode} => {
+                match *opcode {
+                    OP_UPLOAD => write!(f, "server rejected upload"),
+                    OP_DOWNLOAD => write!(f, "server rejected download"),
+                    OP_REMOVE => write!(f, "server rejected remove"),
+                    _ => unreachable!()
+                }
+            },
             Error::NotFound(n) => write!(f, "'{}' not found on server", n),
             Error::ShortRead { expected, got } => {
                 write!(f, "short read: expected {} bytes, got {}", expected, got)
             }
             Error::ProgressTemplate(e) => write!(f, "progress bar template error: {}", e),
             Error::ConfigRead { path, source } => {
-                write!(f, "failed to read config {}: {}", path.display(), source);
+                let _ = write!(f, "failed to read config {}: {}", path.display(), source);
                 write!(f, "\n {} use ´{}´ to create a config!", style("help:").bold().green(), style("uplink init [OPTIONS]").cyan())
             }
             Error::ConfigWrite { path, source } => {
@@ -225,7 +248,7 @@ fn progress(len: u64, msg: &'static str, spinner: &'static str) -> Result<Progre
             .progress_chars("█▉▊▋▌▍▎▏ "),
     );
     pb.set_message(msg);
-    pb.enable_steady_tick(std::time::Duration::from_millis(80));
+    pb.enable_steady_tick(Duration::from_millis(80));
     Ok(pb)
 }
 
@@ -315,13 +338,32 @@ fn upload(server: SocketAddrV4, name: &str, dir: &Path) -> Result<()> {
     let mut ack = [0u8; 1];
     stream.read_exact(&mut ack)?;
     if ack[0] != 1 {
-        return Err(Error::ServerRejected);
+        return Err(Error::ServerRejected {opcode: OP_UPLOAD});
     }
     info(
         "uploaded",
         format!("{}", style(name).bold().yellow())
     );
     Ok(())
+}
+
+struct Metadata {
+    time: u64
+}
+
+impl fmt::Display for Metadata {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let datetime: DateTime<Utc> = DateTime::from_timestamp(self.time as i64, 0).unwrap();
+        write!(f, "{}", datetime.format("%d.%m.%Y %H:%M:%S"))
+    }
+}
+
+fn read_meta(stream: &mut TcpStream) -> Result<Metadata> {
+    let mut len_buf = [0u8; 8];
+    stream.read_exact(&mut len_buf)?;
+    let time = u64::from_le_bytes(len_buf);
+    let meta = Metadata {time};
+    Ok(meta)
 }
 
 fn download(server: SocketAddrV4, name: &str, dest: &Path) -> Result<()> {
@@ -340,9 +382,11 @@ fn download(server: SocketAddrV4, name: &str, dest: &Path) -> Result<()> {
     let mut len_buf = [0u8; 8];
     stream.read_exact(&mut len_buf)?;
     let len = u64::from_le_bytes(len_buf);
+    let meta = read_meta(&mut stream)?;
     if len == 0 {
         return Err(Error::NotFound(name.to_string()));
     }
+    info("uploaded", style(meta).green().bold().to_string());
     info("size", style(format_size(len)).green().bold().to_string());
 
     let pb = progress(len, "download", SPINNER_LOAD)?;
@@ -387,15 +431,57 @@ fn init(
 }
 
 fn push(cfg_path: PathBuf) -> Result<()> {
-    step(format!("Loading {}", style(cfg_path.display()).cyan()));
     let cfg = Config::load(&cfg_path)?;
     upload(cfg.server, &cfg.name, &cfg.dir)
 }
 
 fn pull(cfg_path: PathBuf) -> Result<()> {
-    step(format!("Loading {}", style(cfg_path.display()).cyan()));
     let cfg = Config::load(&cfg_path)?;
     download(cfg.server, &cfg.name, &cfg.dest)
+}
+
+fn remove(name: Option<String>, server: SocketAddrV4, config_path: Option<PathBuf>, preserve_cfg: bool) -> Result<()> {
+    let (addr, name, cfg_path) = if let Some(ref cfg_path) = config_path {
+        let cfg = Config::load(cfg_path)?;
+        (cfg.server, cfg.name, Some(cfg_path))
+    } else if let Some(name) = name {
+        (server, name, None)
+    } else {
+        let cfg = Config::load(&default_cfg_path())?;
+        (cfg.server, cfg.name, Some(&default_cfg_path()))
+    };
+
+    step(format!(
+        "Deleting '{}' from {}",
+        style(&name).cyan(),
+        style(server).cyan()
+    ));
+
+    let mut stream = TcpStream::connect(SocketAddr::V4(addr)).map_err(|source| Error::Connect {
+        addr: server.to_string(),
+        source,
+    })?;
+    stream.write_all(&[OP_REMOVE])?;
+    write_name(&mut stream, &name)?;
+    let mut accept_buf = [0u8; 1];
+    stream.read_exact(&mut accept_buf)?;
+    match accept_buf[0] {
+        0 => Err(Error::NotFound(name)),
+        1 => Ok(()),
+        _ => Err(Error::ServerRejected {opcode: OP_REMOVE})
+    }?;
+
+    if !preserve_cfg && let Some(cfg) = cfg_path {
+        info(
+            "removed config",
+            format!("{:?}", style(cfg.clone()).bold().yellow())
+        );
+        fs::remove_file(cfg)?;
+    }
+
+    println!("  {}", style("done").green().bold());
+
+    Ok(())
 }
 
 fn run() -> Result<()> {
@@ -412,6 +498,8 @@ fn run() -> Result<()> {
             dest.unwrap_or(dir),
             cfg_path.unwrap_or_else(default_cfg_path),
         ),
+        Cmd::Remove { name, cfg, preserve_cfg } =>
+            remove(name, cli.server, cfg, preserve_cfg),
     }
 }
 
