@@ -7,13 +7,17 @@ use std::process::ExitCode;
 use std::thread;
 use std::time::UNIX_EPOCH;
 
-#[path = "../../protocol.rs"]
+#[path = "../../shared/protocol.rs"]
 #[allow(unused)]
 mod protocol;
 
-#[path = "../../fasthash.rs"]
+#[path = "../../shared/fasthash.rs"]
 #[allow(unused)]
 mod fasthash;
+
+#[path = "../../shared/auth.rs"]
+#[allow(unused)]
+mod auth;
 
 mod error;
 mod transfer;
