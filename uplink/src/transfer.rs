@@ -2,10 +2,11 @@ use console::style;
 use std::fs::{self, File};
 use std::io::{self, Cursor, Read, Seek, Write};
 use std::net::{SocketAddr, SocketAddrV4, TcpStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 use crate::output::{info, progress, spinner, step, RandomMessage};
+use crate::auth::{load_key, write_auth, AuthKey};
 use crate::protocol::{create_fingerprint, read_diffmap, write_dirfp, DiffMap, DirFp, OP_DOWNLOAD, OP_UPLOAD};
 use crate::fasthash::{
     chunk_len, compare_hashes, hash_file, read_hashes, read_needed, read_part_path, reconstruct_file,
@@ -14,6 +15,31 @@ use crate::fasthash::{
 use chrono::{DateTime, Utc};
 
 const ZSTD_LEVEL: i32 = 3;
+
+fn load_auth(path: &PathBuf, no_auth: bool) -> Result<AuthKey> {
+    if no_auth {
+        return Ok([0u8; 5120]);
+    }
+    let f = std::fs::File::open(path).map_err(|source| Error::AuthKeyLoad {
+        path: path.clone(),
+        source,
+    })?;
+    load_key(f).map_err(|source| Error::AuthKeyLoad {
+        path: path.clone(),
+        source,
+    })
+}
+
+fn send_auth(stream: &mut TcpStream, path: &PathBuf, no_auth: bool) -> Result<()> {
+    let key = load_auth(path, no_auth)?;
+    write_auth(stream, &key)?;
+    let mut resp = [0u8; 1];
+    stream.read_exact(&mut resp)?;
+    if resp[0] != 1 {
+        return Err(Error::AuthFailed);
+    }
+    Ok(())
+}
 
 fn format_size(bytes: u64) -> String {
     let units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
@@ -279,12 +305,13 @@ fn read_meta(stream: &mut TcpStream) -> Result<Metadata> {
     Ok(meta)
 }
 
-pub fn upload(server: SocketAddrV4, name: &str, dir: &Path) -> Result<()> {
+pub fn upload(server: SocketAddrV4, name: &str, dir: &Path, auth_key_path: PathBuf, no_auth: bool) -> Result<()> {
     let mut stream = TcpStream::connect(SocketAddr::V4(server)).map_err(|source| Error::Connect {
         addr: server.to_string(),
         source,
     })?;
     stream.write_all(&[OP_UPLOAD])?;
+    send_auth(&mut stream, &auth_key_path, no_auth)?;
     write_name(&mut stream, name)?;
     let fp = create_fingerprint(dir)?;
     write_dirfp(&mut stream, &fp)?;
@@ -334,7 +361,7 @@ pub fn upload(server: SocketAddrV4, name: &str, dir: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn download(server: SocketAddrV4, name: &str, dest: &Path, no_delete: bool) -> Result<()> {
+pub fn download(server: SocketAddrV4, name: &str, dest: &Path, no_delete: bool, auth_key_path: PathBuf, no_auth: bool) -> Result<()> {
     step(format!(
         "Requesting '{}' from {}",
         style(name).cyan(),
@@ -345,6 +372,7 @@ pub fn download(server: SocketAddrV4, name: &str, dest: &Path, no_delete: bool) 
         source,
     })?;
     stream.write_all(&[OP_DOWNLOAD])?;
+    send_auth(&mut stream, &auth_key_path, no_auth)?;
     write_name(&mut stream, name)?;
 
     let local_fp = if dest.is_dir() {

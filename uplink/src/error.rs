@@ -17,6 +17,9 @@ pub enum Error {
     ConfigWrite { path: PathBuf, source: io::Error },
     ConfigParse { path: PathBuf, source: toml::de::Error },
     ConfigSerialize(toml::ser::Error),
+    KeyGen { path: PathBuf, source: io::Error },
+    AuthFailed,
+    AuthKeyLoad { path: PathBuf, source: io::Error },
 }
 
 impl fmt::Display for Error {
@@ -54,6 +57,13 @@ impl fmt::Display for Error {
                 write!(f, "invalid config {}: {}", path.display(), source)
             }
             Error::ConfigSerialize(e) => write!(f, "failed to serialize config: {}", e),
+            Error::KeyGen { path, source } => {
+                write!(f, "failed to generate and store key at {}: {}", path.display(), source)
+            }
+            Error::AuthFailed => write!(f, "authentication failed"),
+            Error::AuthKeyLoad { path, source } => {
+                write!(f, "failed to load auth key {}: {}", path.display(), source)
+            }
         }
     }
 }
@@ -68,6 +78,8 @@ impl std::error::Error for Error {
             Error::ConfigWrite { source, .. } => Some(source),
             Error::ConfigParse { source, .. } => Some(source),
             Error::ConfigSerialize(e) => Some(e),
+            Error::KeyGen { source, .. } => Some(source),
+            Error::AuthKeyLoad { source, .. } => Some(source),
             _ => None,
         }
     }

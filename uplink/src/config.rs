@@ -14,6 +14,8 @@ pub struct Config {
     pub dest: PathBuf,
     pub server: SocketAddrV4,
     pub no_delete: bool,
+    pub auth_key: PathBuf,
+    pub no_auth: bool,
 }
 
 impl Config {

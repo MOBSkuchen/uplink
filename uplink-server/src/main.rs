@@ -35,6 +35,8 @@ struct Cli {
     bind: SocketAddrV4,
     #[arg(short, long, default_value = "./uplink-store")]
     storage: PathBuf,
+    #[arg(short = 'a', long = "auth-key", aliases = ["auth", "key", "k"], default_value = ".UPLINK-AUTH")]
+    auth_key: Option<PathBuf>,
 }
 
 
@@ -231,9 +233,19 @@ fn handle_remove(stream: &mut TcpStream, storage: &Path) -> Result<()> {
     Ok(())
 }
 
-fn handle_client(mut stream: TcpStream, storage: PathBuf) -> Result<()> {
+fn handle_client(mut stream: TcpStream, storage: PathBuf, server_key: Option<auth::AuthKey>) -> Result<()> {
     let mut op = [0u8; 1];
     stream.read_exact(&mut op)?;
+
+    let client_key = auth::read_auth(&mut stream)?;
+    if let Some(expected) = server_key {
+        if client_key != expected {
+            stream.write_all(&[0u8])?;
+            return Err(Error::AuthFailed);
+        }
+    }
+    stream.write_all(&[1u8])?;
+
     match op[0] {
         OP_UPLOAD => handle_upload(&mut stream, &storage),
         OP_DOWNLOAD => handle_download(&mut stream, &storage),
@@ -251,29 +263,39 @@ fn print_error_chain(err: &Error) {
     }
 }
 
+fn load_server_key(path: &PathBuf) -> Result<auth::AuthKey> {
+    let f = File::open(path).map_err(|e| Error::LoadStorage { path: path.clone(), source: e })?;
+    auth::load_key(f).map_err(|e| Error::LoadStorage { path: path.clone(), source: e })
+}
+
 fn run() -> Result<()> {
     let cli = Cli::parse();
     fs::create_dir_all(&cli.storage).map_err(|source| Error::CreateStorage {
         path: cli.storage.clone(),
         source,
     })?;
+
+    let server_key = cli.auth_key.as_ref().map(load_server_key).transpose()?;
+
     let listener = TcpListener::bind(cli.bind).map_err(|source| Error::Bind {
         addr: cli.bind.to_string(),
         source,
     })?;
     println!(
-        "uplink-server listening on {} (storage: {})",
+        "uplink-server listening on {} (storage: {}, auth: {})",
         cli.bind,
-        cli.storage.display()
+        cli.storage.display(),
+        if server_key.is_some() { "enabled" } else { "disabled" }
     );
 
     for incoming in listener.incoming() {
         match incoming {
             Ok(stream) => {
                 let storage = cli.storage.clone();
+                let key = server_key;
                 thread::spawn(move || {
                     let peer = stream.peer_addr().ok();
-                    if let Err(e) = handle_client(stream, storage) {
+                    if let Err(e) = handle_client(stream, storage, key) {
                         eprint!("client {:?} ", peer);
                         print_error_chain(&e);
                     }

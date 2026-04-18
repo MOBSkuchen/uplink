@@ -15,6 +15,7 @@ pub enum Error {
     PayloadTooLarge(u64),
     ClientDisconnected,
     UnknownOp(u8),
+    AuthFailed,
 }
 
 impl fmt::Display for Error {
@@ -31,6 +32,7 @@ impl fmt::Display for Error {
             Error::PayloadTooLarge(n) => write!(f, "payload too large: {} bytes", n),
             Error::ClientDisconnected => write!(f, "client disconnected mid-transfer"),
             Error::UnknownOp(b) => write!(f, "unknown op 0x{:02x}", b),
+            Error::AuthFailed => write!(f, "authentication failed"),
             Error::LoadStorage { path, source } => {
                 write!(f, "failed to load storage meta {}: {}", path.display(), source)
             }

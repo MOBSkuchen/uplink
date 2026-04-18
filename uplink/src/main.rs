@@ -1,3 +1,5 @@
+use std::fs::File;
+use std::io;
 use clap::{Parser, Subcommand};
 use console::style;
 use std::io::Read;
@@ -25,12 +27,17 @@ mod transfer;
 use config::{default_cfg_path, Config};
 use error::{Error, Result};
 use transfer::{download, upload};
+use crate::auth::save_key;
 
 #[derive(Parser)]
 #[command(name = "uplink", about = "Directory sync client")]
 struct Cli {
-    #[arg(short, long, default_value = "127.0.0.1:4500")]
+    #[arg(short = 's', long = "server", aliases = ["host"], default_value = "127.0.0.1:4500")]
     server: SocketAddrV4,
+    #[arg(short = 'a', long = "auth-key", aliases = ["auth", "key", "k"], default_value = ".UPLINK-AUTH")]
+    auth_key: PathBuf,
+    #[arg(short = 'n', long = "no-auth", aliases = ["na", "unsafe"], default_value = "false")]
+    no_auth: bool,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -62,6 +69,15 @@ enum Cmd {
         #[arg(long, alias = "preserve-config", default_value = "false", required = false)]
         preserve_cfg: bool,
     },
+    #[command(
+        name = "gen-key",
+        aliases = ["keygen", "key-gen", "create-key", "new-key"],
+        about = "Generates and stores a new authentication key"
+    )]
+    KeyGen {
+        #[arg(long, short = 'p', default_value = ".UPLINK-AUTH")]
+        path: PathBuf
+    }
 }
 
 fn init(
@@ -71,6 +87,8 @@ fn init(
     dest: PathBuf,
     cfg_path: PathBuf,
     no_delete: bool,
+    auth_key: PathBuf,
+    no_auth: bool,
 ) -> Result<()> {
     output::step(format!("Initializing {}", style(cfg_path.display()).cyan()));
     let cfg = Config {
@@ -79,6 +97,8 @@ fn init(
         dest,
         server,
         no_delete,
+        auth_key,
+        no_auth
     };
     cfg.save(&cfg_path)?;
     output::info("name", style(&cfg.name).bold().yellow().to_string());
@@ -86,17 +106,19 @@ fn init(
     output::info("dest", style(cfg.dest.display()).cyan().to_string());
     output::info("server", style(cfg.server).cyan().to_string());
     output::info("no-delete (preserve)", style(cfg.no_delete).cyan().to_string());
+    output::info("auth-key", style(cfg.auth_key.display()).cyan().to_string());
+    output::info("no-auth", style(cfg.no_auth).cyan().to_string());
     Ok(())
 }
 
 fn push(cfg_path: PathBuf) -> Result<()> {
     let cfg = Config::load(&cfg_path)?;
-    upload(cfg.server, &cfg.name, &cfg.dir)
+    upload(cfg.server, &cfg.name, &cfg.dir, cfg.auth_key, cfg.no_auth)
 }
 
 fn pull(cfg_path: PathBuf) -> Result<()> {
     let cfg = Config::load(&cfg_path)?;
-    download(cfg.server, &cfg.name, &cfg.dest, cfg.no_delete)
+    download(cfg.server, &cfg.name, &cfg.dest, cfg.no_delete, cfg.auth_key, cfg.no_auth)
 }
 
 fn remove(
@@ -104,6 +126,8 @@ fn remove(
     server: SocketAddrV4,
     config_path: Option<PathBuf>,
     preserve_cfg: bool,
+    auth_key_path: PathBuf,
+    no_auth: bool,
 ) -> Result<()> {
     let (addr, name, cfg_path) = if let Some(ref cfg_path) = config_path {
         let cfg = Config::load(cfg_path)?;
@@ -130,6 +154,26 @@ fn remove(
         source,
     })?;
     stream.write_all(&[OP_REMOVE])?;
+
+    let key = if no_auth {
+        [0u8; 5120]
+    } else {
+        let f = std::fs::File::open(&auth_key_path).map_err(|source| Error::AuthKeyLoad {
+            path: auth_key_path.clone(),
+            source,
+        })?;
+        auth::load_key(f).map_err(|source| Error::AuthKeyLoad {
+            path: auth_key_path.clone(),
+            source,
+        })?
+    };
+    auth::write_auth(&mut stream, &key)?;
+    let mut resp = [0u8; 1];
+    stream.read_exact(&mut resp)?;
+    if resp[0] != 1 {
+        return Err(Error::AuthFailed);
+    }
+
     let bytes = name.as_bytes();
     if bytes.is_empty() {
         return Err(Error::InvalidName);
@@ -161,11 +205,23 @@ fn remove(
     Ok(())
 }
 
+fn gen_key(path: PathBuf) -> Result<()> {
+    output::step("Generating key");
+    let f = || -> io::Result<()> {
+        let file = File::options().write(true).create(true).truncate(true).open(&path)?;
+        save_key(file)?;
+        Ok(())
+    };
+    f().map_err(|source| {Error::KeyGen { path: path.clone(), source }})?;
+    output::info("stored key", path.as_os_str().to_str().unwrap());
+    Ok(())
+}
+
 fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Upload { name, dir } => upload(cli.server, &name, &dir),
-        Cmd::Download { name, dest, no_delete } => download(cli.server, &name, &dest, no_delete),
+        Cmd::Upload { name, dir } => upload(cli.server, &name, &dir, cli.auth_key, cli.no_auth),
+        Cmd::Download { name, dest, no_delete } => download(cli.server, &name, &dest, no_delete, cli.auth_key, cli.no_auth),
         Cmd::Push { cfg } => push(cfg.unwrap_or_else(default_cfg_path)),
         Cmd::Pull { cfg } => pull(cfg.unwrap_or_else(default_cfg_path)),
         Cmd::Init {
@@ -173,7 +229,7 @@ fn run() -> Result<()> {
             dir,
             dest,
             cfg_path,
-            no_delete,
+            no_delete
         } => init(
             cli.server,
             name,
@@ -181,12 +237,15 @@ fn run() -> Result<()> {
             dest.unwrap_or(dir),
             cfg_path.unwrap_or_else(default_cfg_path),
             no_delete,
+            cli.auth_key,
+            cli.no_auth
         ),
         Cmd::Remove {
             name,
             cfg,
             preserve_cfg,
-        } => remove(name, cli.server, cfg, preserve_cfg),
+        } => remove(name, cli.server, cfg, preserve_cfg, cli.auth_key, cli.no_auth),
+        Cmd::KeyGen { path } => gen_key(path)
     }
 }
 
