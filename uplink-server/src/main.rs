@@ -1,11 +1,9 @@
 use clap::Parser;
-use std::fmt;
 use std::fs::{self, File};
-use std::io::{self, Cursor, Read, Seek, Write};
+use std::io::{self, Cursor, Read, Write};
 use std::net::{SocketAddrV4, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::string::FromUtf8Error;
 use std::thread;
 use std::time::UNIX_EPOCH;
 
@@ -17,14 +15,13 @@ mod protocol;
 #[allow(unused)]
 mod fasthash;
 
+mod error;
+mod transfer;
+
+use crate::error::{Error, Result};
 use crate::protocol::{
-    OP_UPLOAD, OP_DOWNLOAD, OP_REMOVE, MAX_NAME_LEN, MAX_PAYLOAD,
-    DirFp, DiffMap, diff, read_dirfp, write_dirfp, write_diffmap,
-};
-use crate::fasthash::{
-    CHUNK_SIZE, PART_THRESHOLD,
-    hash_file, compare_hashes, chunk_len, reconstruct_file,
-    write_part_path, write_hashes, read_hashes, write_needed, read_needed, read_part_path,
+    OP_UPLOAD, OP_DOWNLOAD, OP_REMOVE, MAX_NAME_LEN,
+    DirFp, diff, read_dirfp, write_dirfp, write_diffmap,
 };
 
 #[derive(Parser)]
@@ -36,66 +33,6 @@ struct Cli {
     storage: PathBuf,
 }
 
-#[derive(Debug)]
-enum Error {
-    Io(io::Error),
-    Bind { addr: String, source: io::Error },
-    CreateStorage { path: PathBuf, source: io::Error },
-    LoadStorage { path: PathBuf, source: io::Error },
-    InvalidNameLength(u32),
-    IllegalName(String),
-    NameNotUtf8(FromUtf8Error),
-    PayloadTooLarge(u64),
-    ClientDisconnected,
-    UnknownOp(u8),
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Error::Io(e) => write!(f, "io error: {}", e),
-            Error::Bind { addr, source } => write!(f, "failed to bind {}: {}", addr, source),
-            Error::CreateStorage { path, source } => {
-                write!(f, "failed to create storage {}: {}", path.display(), source)
-            }
-            Error::InvalidNameLength(n) => write!(f, "invalid name length {}", n),
-            Error::IllegalName(s) => write!(f, "illegal name '{}'", s),
-            Error::NameNotUtf8(e) => write!(f, "name not valid utf-8: {}", e),
-            Error::PayloadTooLarge(n) => write!(f, "payload too large: {} bytes", n),
-            Error::ClientDisconnected => write!(f, "client disconnected mid-transfer"),
-            Error::UnknownOp(b) => write!(f, "unknown op 0x{:02x}", b),
-            Error::LoadStorage { path, source } => {
-                write!(f, "failed to load storage meta {}: {}", path.display(), source)
-            }
-        }
-    }
-}
-
-impl std::error::Error for Error {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Error::Io(e) => Some(e),
-            Error::Bind { source, .. } => Some(source),
-            Error::CreateStorage { source, .. } => Some(source),
-            Error::NameNotUtf8(e) => Some(e),
-            _ => None,
-        }
-    }
-}
-
-impl From<io::Error> for Error {
-    fn from(e: io::Error) -> Self {
-        Error::Io(e)
-    }
-}
-
-impl From<FromUtf8Error> for Error {
-    fn from(e: FromUtf8Error) -> Self {
-        Error::NameNotUtf8(e)
-    }
-}
-
-type Result<T> = std::result::Result<T, Error>;
 
 fn read_name(stream: &mut TcpStream) -> Result<String> {
     let mut len_buf = [0u8; 4];
@@ -163,130 +100,6 @@ fn give_meta(storage: &Path, name: &str) -> Result<[u8; 8]> {
     Ok(buf)
 }
 
-fn split_part_candidates(
-    dm: &DiffMap,
-    source_fp: &DirFp,
-    other_fp: &DirFp,
-) -> (Vec<String>, Vec<String>) {
-    let mut part_paths = Vec::new();
-    let mut remaining = Vec::new();
-
-    if let Some(uploads) = dm.get(&0) {
-        for path in uploads {
-            let in_other = other_fp.contains_key(path);
-            let source_size = source_fp.get(path).map(|(_, sz, _)| *sz).unwrap_or(0);
-            if in_other && source_size >= PART_THRESHOLD {
-                part_paths.push(path.clone());
-            } else {
-                remaining.push(path.clone());
-            }
-        }
-    }
-
-    part_paths.sort();
-    remaining.sort();
-    (part_paths, remaining)
-}
-
-/// Server-side: receive part transfer from client (upload scenario).
-/// Client sends hashes, server compares, sends needed indices, receives chunks.
-fn recv_part_transfer_server(stream: &mut TcpStream, dir: &Path) -> Result<()> {
-    let mut u32_buf = [0u8; 4];
-    stream.read_exact(&mut u32_buf)?;
-    let part_count = u32::from_le_bytes(u32_buf) as usize;
-
-    for _ in 0..part_count {
-        let path = read_part_path(stream)?;
-        let (new_file_len, source_hashes) = read_hashes(stream)?;
-
-        let local_path = dir.join(&path);
-        let local_hashes = if local_path.exists() {
-            hash_file(&local_path)?.1
-        } else {
-            Vec::new()
-        };
-
-        let needed = compare_hashes(&source_hashes, &local_hashes);
-        println!("  part-sync '{}': {}/{} chunks needed", path, needed.len(), source_hashes.len());
-        write_needed(stream, &needed)?;
-
-        let mut chunk_data = Vec::with_capacity(needed.len());
-        for &idx in &needed {
-            let clen = chunk_len(idx, new_file_len);
-            let mut buf = vec![0u8; clen];
-            stream.read_exact(&mut buf)?;
-            chunk_data.push(buf);
-        }
-
-        let reconstructed = reconstruct_file(&local_path, new_file_len, &needed, &chunk_data)?;
-        if let Some(parent) = local_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&local_path, &reconstructed)?;
-    }
-    Ok(())
-}
-
-/// Server-side: send part transfer to client (download scenario).
-/// Server sends hashes, client compares, sends needed indices, server sends chunks.
-fn send_part_transfer_server(
-    stream: &mut TcpStream,
-    dir: &Path,
-    part_paths: &[String],
-) -> Result<()> {
-    stream.write_all(&(part_paths.len() as u32).to_le_bytes())?;
-
-    for path in part_paths {
-        let full = dir.join(path);
-        let (file_len, hashes) = hash_file(&full)?;
-
-        write_part_path(stream, path)?;
-        write_hashes(stream, file_len, &hashes)?;
-
-        let needed = read_needed(stream)?;
-        println!("  part-sync '{}': {}/{} chunks requested", path, needed.len(), hashes.len());
-
-        for &idx in &needed {
-            let clen = chunk_len(idx, file_len);
-            let start = idx as u64 * CHUNK_SIZE as u64;
-            let mut buf = vec![0u8; clen];
-            let mut f = File::open(&full)?;
-            f.seek(io::SeekFrom::Start(start))?;
-            f.read_exact(&mut buf)?;
-            stream.write_all(&buf)?;
-        }
-    }
-    Ok(())
-}
-
-fn recv_blob(stream: &mut TcpStream, dir: &Path) -> Result<()> {
-    let mut len_buf = [0u8; 8];
-    stream.read_exact(&mut len_buf)?;
-    let len = u64::from_le_bytes(len_buf);
-    if len == 0 { return Ok(()); }
-    if len > MAX_PAYLOAD {
-        return Err(Error::PayloadTooLarge(len));
-    }
-
-    let mut compressed = vec![0u8; len as usize];
-    let mut received = 0usize;
-    while received < len as usize {
-        let n = stream.read(&mut compressed[received..])?;
-        if n == 0 {
-            return Err(Error::ClientDisconnected);
-        }
-        received += n;
-    }
-
-    let mut decompressed = Vec::new();
-    let mut decoder = zstd::Decoder::new(Cursor::new(&compressed))?;
-    io::copy(&mut decoder, &mut decompressed)?;
-
-    let mut archive = tar::Archive::new(Cursor::new(&decompressed));
-    archive.unpack(dir)?;
-    println!("  received {} bytes compressed", len);
-    Ok(())
-}
 
 fn handle_upload(stream: &mut TcpStream, storage: &Path) -> Result<()> {
     let name = read_name(stream)?;
@@ -307,20 +120,18 @@ fn handle_upload(stream: &mut TcpStream, storage: &Path) -> Result<()> {
     let dir = store_dir(storage, &name);
     fs::create_dir_all(&dir)?;
 
-    // Create dirs (opcode 2)
     if let Some(dirs) = dm.get(&2) {
         for d in dirs {
             fs::create_dir_all(dir.join(d))?;
         }
     }
 
-    // Phase 1: Part transfer for large modified files
-    recv_part_transfer_server(stream, &dir)?;
+    // 1: Part transfer for large modified files
+    transfer::recv_part_transfer_server(stream, &dir)?;
 
-    // Phase 2: Tar transfer for remaining files
-    recv_blob(stream, &dir)?;
+    // 2: Tar transfer for remaining files
+    transfer::recv_blob(stream, &dir)?;
 
-    // Apply deletes (opcode 1)
     if let Some(deletions) = dm.get(&1) {
         for path in deletions {
             let full = dir.join(path);
@@ -332,7 +143,6 @@ fn handle_upload(stream: &mut TcpStream, storage: &Path) -> Result<()> {
         }
     }
 
-    // After applying all diffs, storage matches client
     save_stored_fp(storage, &name, &client_fp)?;
     store_meta(storage, &name)?;
     stream.write_all(&[1u8])?;
@@ -365,13 +175,12 @@ fn handle_download(stream: &mut TcpStream, storage: &Path) -> Result<()> {
         return Ok(());
     }
 
-    // Split opcode-0 into part-transfer and bulk
-    let (part_paths, remaining_paths) = split_part_candidates(&dm, &server_fp, &client_fp);
+    let (part_paths, remaining_paths) = transfer::split_part_candidates(&dm, &server_fp, &client_fp);
 
-    // Phase 1: Part transfer
-    send_part_transfer_server(stream, &dir, &part_paths)?;
+    // 1: Part transfer
+    transfer::send_part_transfer_server(stream, &dir, &part_paths)?;
 
-    // Phase 2: Tar transfer for remaining files
+    // 2: Tar transfer for remaining files
     if !remaining_paths.is_empty() {
         let mut tar_buf = Vec::new();
         {
