@@ -30,13 +30,13 @@ use transfer::{download, upload};
 use crate::auth::save_key;
 
 #[derive(Parser)]
-#[command(name = "uplink", about = "Directory sync client")]
+#[command(name = "uplink", about = "Directory sync client", author = "MOBSkuchen")]
 struct Cli {
-    #[arg(short = 's', long = "server", aliases = ["host"], default_value = "127.0.0.1:4500")]
+    #[arg(short = 's', long = "server", aliases = ["host"], default_value = "127.0.0.1:4500", help = "Address of the hot server running the uplink server")]
     server: SocketAddrV4,
-    #[arg(short = 'a', long = "auth-key", aliases = ["auth", "key", "k"], default_value = ".UPLINK-AUTH")]
+    #[arg(short = 'a', long = "auth-key", aliases = ["auth", "key", "k"], default_value = ".UPLINK-AUTH", help = "Path of the authentication key (must be at least 5KB)")]
     auth_key: PathBuf,
-    #[arg(short = 'n', long = "no-auth", aliases = ["na", "unsafe"], default_value = "false")]
+    #[arg(short = 'n', long = "no-auth", aliases = ["na", "unsafe"], default_value = "false", help = "Send no authentication to the server")]
     no_auth: bool,
     #[command(subcommand)]
     cmd: Cmd,
@@ -44,29 +44,74 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    Upload { name: String, dir: PathBuf },
-    Download {
+    #[command(
+        name = "upload",
+        about = "Upload a directory to the server"
+    )]
+    Upload {
+        #[arg(long, short = 'n', aliases = ["title", "sign", "entry"], help = "Access name of the directory")]
         name: String,
+        #[arg(long = "target", short = 't', aliases = ["dir", "upload", "path"], help = "Directory to upload")]
+        dir: PathBuf
+    },
+    #[command(
+        name = "download",
+        about = "Download an entry from the server"
+    )]
+    Download {
+        #[arg(long, short = 'n', aliases = ["title", "sign", "entry"], help = "Access name of the directory")]
+        name: String,
+        #[arg(long, short = 'd', aliases = ["destination", "store"], help = "Destination directory for download")]
         dest: PathBuf,
         #[arg(long, alias = "preserve", default_value = "true")]
         no_delete: bool,
     },
-    Push { cfg: Option<PathBuf> },
-    Pull { cfg: Option<PathBuf> },
+    #[command(
+        name = "push",
+        aliases = ["give", "post", "publish"],
+        about = "Push an entry defined in the config to the server"
+    )]
+    Push {
+        #[arg(long, short = 'p', aliases = ["cfg", "config"], default_value = ".UPLINK.toml", help = "Path of the config file")]
+        cfg: PathBuf
+    },
+    #[command(
+        name = "pull",
+        aliases = ["get"],
+        about = "Remove an entry from the server"
+    )]
+    Pull {
+        #[arg(long, short = 'p', aliases = ["cfg", "config"], default_value = ".UPLINK.toml", help = "Path of the config file")]
+        cfg: PathBuf
+    },
+    #[command(
+        name = "init",
+        aliases = ["new", "setup"],
+        about = "Create a new config"
+    )]
     Init {
+        #[arg(long, short = 'n', aliases = ["title", "sign", "entry"], help = "Access name of the directory")]
         name: String,
+        #[arg(long = "target", short = 't', aliases = ["dir", "upload", "path"], help = "Directory to upload")]
         dir: PathBuf,
+        #[arg(long = "dest", short = 'd', aliases = ["destination", "store"], help = "Destination directory for download")]
         dest: Option<PathBuf>,
-        cfg_path: Option<PathBuf>,
-        #[arg(long, alias = "preserve", default_value = "true")]
+        #[arg(long = "cfg-path", short = 'p', aliases = ["cfg", "config"], default_value = ".UPLINK.toml", help = "Path of the config file")]
+        cfg_path: PathBuf,
+        #[arg(long = "no-delete", alias = "preserve", default_value = "true", help = "Don't delete local files when downloading")]
         no_delete: bool,
     },
+    #[command(
+        name = "remove",
+        aliases = ["delete"],
+        about = "Remove an entry from the server"
+    )]
     Remove {
-        #[arg(long, group = "target")]
+        #[arg(long, short = 'n', aliases = ["title", "sign", "entry"], help = "Access name of the directory", group = "target")]
         name: Option<String>,
-        #[arg(long, group = "target", conflicts_with = "name")]
+        #[arg(long, short = 'p', aliases = ["cfg", "config"], default_value = ".UPLINK.toml", help = "Path of the config file", group = "target", conflicts_with = "name")]
         cfg: Option<PathBuf>,
-        #[arg(long, alias = "preserve-config", default_value = "false", required = false)]
+        #[arg(long, alias = "preserve-config", default_value = "false", required = false, requires = "cfg", help = "Don't delete config when removing remote entry")]
         preserve_cfg: bool,
     },
     #[command(
@@ -75,7 +120,7 @@ enum Cmd {
         about = "Generates and stores a new authentication key"
     )]
     KeyGen {
-        #[arg(long, short = 'p', default_value = ".UPLINK-AUTH")]
+        #[arg(long, short = 'p', default_value = ".UPLINK-AUTH", help = "Path of the auth key to generate")]
         path: PathBuf
     }
 }
@@ -158,7 +203,7 @@ fn remove(
     let key = if no_auth {
         [0u8; 5120]
     } else {
-        let f = std::fs::File::open(&auth_key_path).map_err(|source| Error::AuthKeyLoad {
+        let f = File::open(&auth_key_path).map_err(|source| Error::AuthKeyLoad {
             path: auth_key_path.clone(),
             source,
         })?;
@@ -222,8 +267,8 @@ fn run() -> Result<()> {
     match cli.cmd {
         Cmd::Upload { name, dir } => upload(cli.server, &name, &dir, cli.auth_key, cli.no_auth),
         Cmd::Download { name, dest, no_delete } => download(cli.server, &name, &dest, no_delete, cli.auth_key, cli.no_auth),
-        Cmd::Push { cfg } => push(cfg.unwrap_or_else(default_cfg_path)),
-        Cmd::Pull { cfg } => pull(cfg.unwrap_or_else(default_cfg_path)),
+        Cmd::Push { cfg } => push(cfg),
+        Cmd::Pull { cfg } => pull(cfg),
         Cmd::Init {
             name,
             dir,
@@ -235,7 +280,7 @@ fn run() -> Result<()> {
             name,
             dir.clone(),
             dest.unwrap_or(dir),
-            cfg_path.unwrap_or_else(default_cfg_path),
+            cfg_path,
             no_delete,
             cli.auth_key,
             cli.no_auth
