@@ -12,15 +12,15 @@ Includes **uplink** (client) and **uplink-server**.
   - Fast Compression
 
 ## Installation
-Use `cargo install uplink` or `cargo install uplink-server`
+Use `cargo install uplink-sync` or `cargo install uplink-sync-server`
 
 ## Usage
-Generate an auth key using `uplink key-gen KEY`
+Generate an auth key using `uplink-sync key-gen KEY`
 
-Start a server using `uplink-server -b 127.0.0.1:4500 -s MY-STORAGE -a KEY`
+Start a server using `uplink-sync-server -b 127.0.0.1:4500 -s MY-STORAGE -a KEY`
 
 Connect via client:
-- Create config `uplink -s 127.0.0.1:4500 -a KEY init -n data -t important -d important -p cfg.toml --no-delete`
-- Patch data `uplink push`
-- Receive patches `uplink pull`
-- Remove entry `uplink remove -n data`
+- Create config `uplink-sync -s 127.0.0.1:4500 -a KEY init -n data -t important -d important -p cfg.toml --no-delete`
+- Patch data `uplink-sync push`
+- Receive patches `uplink-sync pull`
+- Remove entry `uplink-sync remove -n data`
