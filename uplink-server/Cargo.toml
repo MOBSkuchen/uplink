@@ -1,9 +1,14 @@
 [package]
 name = "uplink-sync-server"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
+authors = ["MOBSkuchen"]
+readme = "../README.md"
+repository = "https://github.com/MOBSkuchen/uplink"
+license = "MIT"
+description = "Directory synch server"
 
 [dependencies]
-clap = { version = "4.5", features = ["derive"] }
-tar = "0.4"
-zstd = "0.13"
+clap = { version = "4.6.1", features = ["derive"] }
+tar = "0.4.45"
+zstd = "0.13.3"

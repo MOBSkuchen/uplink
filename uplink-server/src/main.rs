@@ -20,13 +20,13 @@ use crate::protocol::{
 };
 
 #[derive(Parser)]
-#[command(name = "uplink-server", about = "Uplink directory sync server")]
+#[command(name = "uplink-server", about = "Directory sync server")]
 struct Cli {
-    #[arg(short, long, default_value = "0.0.0.0:4500")]
+    #[arg(short = 'b', long = "bind", aliases = ["addr", "address", "ip"], default_value = "0.0.0.0:4500", help = "SocketV4-Address to bind server to")]
     bind: SocketAddrV4,
-    #[arg(short, long, default_value = "./uplink-store")]
+    #[arg(short = 's', long = "storage", aliases = ["stg", "dir", "db"], default_value = "./uplink-store", help = "Directory to store data to")]
     storage: PathBuf,
-    #[arg(short = 'a', long = "auth-key", aliases = ["auth", "key", "k"], default_value = ".UPLINK-AUTH")]
+    #[arg(short = 'a', long = "auth-key", aliases = ["auth", "key", "k"], default_value = ".UPLINK-AUTH", help = "Authentication key path (5KB), use `uplink gen-key` to generate")]
     auth_key: Option<PathBuf>,
 }
 

@@ -1,15 +1,20 @@
 [package]
 name = "uplink-sync"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
+authors = ["MOBSkuchen"]
+readme = "../README.md"
+repository = "https://github.com/MOBSkuchen/uplink"
+license = "MIT"
+description = "Directory sync client"
 
 [dependencies]
-console = "0.15"
-indicatif = "0.17"
-tar = "0.4"
-zstd = "0.13"
-clap = { version = "4.5", features = ["derive"] }
+console = "0.16.3"
+indicatif = "0.18.4"
+tar = "0.4.45"
+zstd = "0.13.3"
+clap = { version = "4.6.1", features = ["derive"] }
 serde = { version = "1.0.228", features = ["derive"] }
 toml = "1.1.2+spec-1.1.0"
-chrono = "0.4"
+chrono = "0.4.44"
 rand = "0.10.1"

@@ -34,7 +34,7 @@ impl fmt::Display for Error {
             Error::UnknownOp(b) => write!(f, "unknown op 0x{:02x}", b),
             Error::AuthFailed => write!(f, "authentication failed"),
             Error::LoadStorage { path, source } => {
-                write!(f, "failed to load storage meta {}: {}", path.display(), source)
+                write!(f, "failed to load storage part {}: {}", path.display(), source)
             }
         }
     }
