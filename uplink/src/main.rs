@@ -7,18 +7,9 @@ use std::net::SocketAddrV4;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-#[path = "../../shared/protocol.rs"]
-#[allow(unused)]
 mod protocol;
-
-#[path = "../../shared/fasthash.rs"]
-#[allow(unused)]
 mod fasthash;
-
-#[path = "../../shared/auth.rs"]
-#[allow(unused)]
 mod auth;
-
 mod config;
 mod error;
 mod output;

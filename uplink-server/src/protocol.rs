@@ -1,8 +1,6 @@
-use std::{fs, io};
+use std::io;
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::path::Path;
-use std::time::UNIX_EPOCH;
 
 // Shared constants
 pub const OP_UPLOAD: u8 = 0;
@@ -16,32 +14,6 @@ pub const MAX_PAYLOAD: u64 = 16 * 1024 * 1024 * 1024;
                     is file, (size, modification date)
 */
 pub type DirFp = HashMap<String, (bool, u64, u64)>;
-
-pub fn create_fingerprint(p: &Path) -> io::Result<DirFp> {
-    let mut fp = DirFp::new();
-    walk_dir(p, p, &mut fp)?;
-    Ok(fp)
-}
-
-fn walk_dir(root: &Path, current: &Path, fp: &mut DirFp) -> io::Result<()> {
-    for entry in fs::read_dir(current)? {
-        let entry = entry?;
-        let meta = entry.metadata()?;
-        let rel = entry.path()
-            .strip_prefix(root)
-            .unwrap()
-            .to_string_lossy()
-            .replace('\\', "/");
-
-        if meta.is_file() {
-            fp.insert(rel, (true, meta.len(), meta.modified()?.duration_since(UNIX_EPOCH).unwrap().as_secs()));
-        } else if meta.is_dir() {
-            fp.insert(rel.clone(), (false, 0, 0));
-            walk_dir(root, &entry.path(), fp)?;
-        }
-    }
-    Ok(())
-}
 
 pub fn write_dirfp<W: Write>(w: &mut W, map: &DirFp) -> io::Result<()> {
     w.write_all(&(map.len() as u64).to_le_bytes())?;
@@ -139,37 +111,4 @@ pub fn write_diffmap<W: Write>(w: &mut W, map: &DiffMap) -> io::Result<()> {
         }
     }
     Ok(())
-}
-
-pub fn read_diffmap<R: Read>(r: &mut R) -> io::Result<DiffMap> {
-    let mut u64_buf = [0u8; 8];
-    let mut u32_buf = [0u8; 4];
-    let mut byte_buf = [0u8; 1];
-
-    r.read_exact(&mut byte_buf)?;
-    let opcode_count = byte_buf[0] as usize;
-
-    let mut map = HashMap::with_capacity(opcode_count);
-    for _ in 0..opcode_count {
-        r.read_exact(&mut byte_buf)?;
-        let opcode = byte_buf[0];
-
-        r.read_exact(&mut u64_buf)?;
-        let path_count = u64::from_le_bytes(u64_buf) as usize;
-
-        let mut paths = Vec::with_capacity(path_count);
-        for _ in 0..path_count {
-            r.read_exact(&mut u32_buf)?;
-            let path_len = u32::from_le_bytes(u32_buf) as usize;
-
-            let mut path_bytes = vec![0u8; path_len];
-            r.read_exact(&mut path_bytes)?;
-            let path = String::from_utf8(path_bytes)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
-            paths.push(path);
-        }
-        map.insert(opcode, paths);
-    }
-    Ok(map)
 }
